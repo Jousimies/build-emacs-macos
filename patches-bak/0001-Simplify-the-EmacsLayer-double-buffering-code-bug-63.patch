@@ -1,0 +1,250 @@
+From 71b8784b027954f9362881ed93f9f754fe7d3832 Mon Sep 17 00:00:00 2001
+From: Alan Third <alan@idiocy.org>
+Date: Sun, 23 Jul 2023 12:00:30 +0100
+Subject: [PATCH] Simplify the EmacsLayer double buffering code (bug#63187)
+
+---
+ src/nsfns.m  | 32 ++++++++++++++++++++++++++++++--
+ src/nsterm.h | 13 ++++++++++++-
+ src/nsterm.m | 50 ++++++++++++++++++++++++++------------------------
+ 3 files changed, 68 insertions(+), 27 deletions(-)
+
+diff --git a/src/nsfns.m b/src/nsfns.m
+index 03cc223ebe0..e59a56eebe2 100644
+--- a/src/nsfns.m
++++ b/src/nsfns.m
+@@ -788,6 +788,26 @@ Turn the input menu (an NSMenu) into a lisp list for tracking on lisp side.
+     }
+ }
+ 
++static void
++ns_set_inhibit_double_buffering (struct frame *f,
++                                 Lisp_Object new_value,
++                                 Lisp_Object old_value)
++{
++#if defined (NS_IMPL_COCOA) && MAC_OS_X_VERSION_MIN_REQUIRED >= 101400
++  if (!EQ (new_value, old_value))
++    {
++      FRAME_DOUBLE_BUFFERED (f) = NILP (new_value);
++
++      /* If the view or layer haven't been created yet this will be a
++         noop.  */
++      [(EmacsLayer *)[FRAME_NS_VIEW (f) layer]
++          setDoubleBuffered:FRAME_DOUBLE_BUFFERED (f)];
++
++      SET_FRAME_GARBAGED (f);
++    }
++#endif
++}
++
+ static void
+ ns_set_internal_border_width (struct frame *f, Lisp_Object arg, Lisp_Object oldval)
+ {
+@@ -1061,8 +1081,8 @@ Turn the input menu (an NSMenu) into a lisp list for tracking on lisp side.
+   gui_set_font_backend, /* generic OK */
+   gui_set_alpha,
+   0, /* x_set_sticky */
+-  0, /* x_set_tool_bar_position */
+-  0, /* x_set_inhibit_double_buffering */
++  0, /* ns_set_tool_bar_position */
++  ns_set_inhibit_double_buffering,
+   ns_set_undecorated,
+   ns_set_parent_frame,
+   0, /* x_set_skip_taskbar */
+@@ -1450,6 +1470,14 @@ Turn the input menu (an NSMenu) into a lisp list for tracking on lisp side.
+   gui_default_parameter (f, parms, Qtitle, Qnil, "title", "Title",
+                          RES_TYPE_STRING);
+ 
++#if defined (NS_IMPL_COCOA) && MAC_OS_X_VERSION_MIN_REQUIRED >= 101400
++  tem = gui_display_get_arg (dpyinfo, parms, Qinhibit_double_buffering, NULL, NULL,
++                             RES_TYPE_BOOLEAN);
++  FRAME_DOUBLE_BUFFERED (f) = NILP (tem) || EQ (tem, Qunbound);
++  store_frame_param (f, Qinhibit_double_buffering,
++                     FRAME_DOUBLE_BUFFERED (f) ? Qnil : Qt);
++#endif
++
+   parms = get_geometry_from_preferences (dpyinfo, parms);
+   window_prompting = gui_figure_window_size (f, parms, false, true);
+ 
+diff --git a/src/nsterm.h b/src/nsterm.h
+index b6e5a813a6d..8d6c58290cc 100644
+--- a/src/nsterm.h
++++ b/src/nsterm.h
+@@ -746,9 +746,11 @@ #define NSTRACE_UNSILENCE()
+   CGColorSpaceRef colorSpace;
+   IOSurfaceRef currentSurface;
+   CGContextRef context;
++  bool doubleBuffered;
+ }
+-- (id) initWithColorSpace: (CGColorSpaceRef)cs;
++- (id) initWithColorSpace: (CGColorSpaceRef)cs doubleBuffered: (bool)db;
+ - (void) setColorSpace: (CGColorSpaceRef)cs;
++- (void) setDoubleBuffered: (bool)db;
+ - (CGContextRef) getContext;
+ @end
+ #endif
+@@ -996,6 +998,11 @@ #define KEY_NS_SHOW_PREFS              ((1<<28)|(0<<16)|14)
+   /* Non-zero if we are doing an animation, e.g. toggling the tool bar.  */
+   int in_animation;
+ 
++#if defined (NS_IMPL_COCOA) && MAC_OS_X_VERSION_MIN_REQUIRED >= 101400
++  /* Is the frame double buffered?  */
++  bool double_buffered;
++#endif
++
+ #ifdef NS_IMPL_GNUSTEP
+   /* Zero if this is the first time a toolbar has been updated on this
+      frame. */
+@@ -1030,6 +1037,10 @@ #define FRAME_POINTER_TYPE(f) ((f)->output_data.ns->current_pointer)
+ 
+ #define FRAME_FONT(f) ((f)->output_data.ns->font)
+ 
++#if defined (NS_IMPL_COCOA) && MAC_OS_X_VERSION_MIN_REQUIRED >= 101400
++#define FRAME_DOUBLE_BUFFERED(f) ((f)->output_data.ns->double_buffered)
++#endif
++
+ #ifdef __OBJC__
+ #define XNS_SCROLL_BAR(vec) ((id) xmint_pointer (vec))
+ #else
+diff --git a/src/nsterm.m b/src/nsterm.m
+index 15554661f03..1410ec04c15 100644
+--- a/src/nsterm.m
++++ b/src/nsterm.m
+@@ -2707,11 +2707,10 @@ Hide the window (X11 semantics)
+   {
+     NSRect srcRect = NSMakeRect (x, from_y, width, height);
+     NSPoint dest = NSMakePoint (x, to_y);
+-    NSRect destRect = NSMakeRect (x, from_y, width, height);
+     EmacsView *view = FRAME_NS_VIEW (f);
+ 
+     [view copyRect:srcRect to:dest];
+-#ifdef NS_IMPL_COCOA
++#if defined (NS_IMPL_COCOA) && MAC_OS_X_VERSION_MAX_ALLOWED < 101400
+     [view setNeedsDisplayInRect:destRect];
+ #endif
+   }
+@@ -8627,7 +8626,8 @@ - (instancetype)toggleToolbar: (id)sender
+ - (CALayer *)makeBackingLayer
+ {
+   EmacsLayer *l = [[EmacsLayer alloc]
+-                    initWithColorSpace:[[[self window] colorSpace] CGColorSpace]];
++                    initWithColorSpace:[[[self window] colorSpace] CGColorSpace]
++                        doubleBuffered:FRAME_DOUBLE_BUFFERED (emacsframe)];
+   [l setDelegate:(id)self];
+   [l setContentsScale:[[self window] backingScaleFactor]];
+ 
+@@ -8684,8 +8684,10 @@ - (void)copyRect:(NSRect)srcRect to:(NSPoint)dest
+                                NSHeight (srcRect));
+ 
+ #if defined (NS_IMPL_COCOA) && MAC_OS_X_VERSION_MIN_REQUIRED >= 101400
+-  double scale = [[self window] backingScaleFactor];
+   CGContextRef context = [(EmacsLayer *)[self layer] getContext];
++  CGContextFlush (context);
++
++  double scale = [[self window] backingScaleFactor];
+   int bpp = CGBitmapContextGetBitsPerPixel (context) / 8;
+   void *pixels = CGBitmapContextGetData (context);
+   int rowSize = CGBitmapContextGetBytesPerRow (context);
+@@ -10455,22 +10457,20 @@ @implementation EmacsLayer
+    cache.  If no free surfaces are found in the cache then a new one
+    is created.  */
+ 
+-#define CACHE_MAX_SIZE 2
+-
+ - (id) initWithColorSpace: (CGColorSpaceRef)cs
++           doubleBuffered: (bool)db
+ {
+-  NSTRACE ("[EmacsLayer initWithColorSpace:]");
++  NSTRACE ("[EmacsLayer initWithColorSpace:doubleBuffered:]");
+ 
+   self = [super init];
+   if (self)
+     {
+-      cache = [[NSMutableArray arrayWithCapacity:CACHE_MAX_SIZE] retain];
+       [self setColorSpace:cs];
++      [self setDoubleBuffered:db];
++      cache = [[NSMutableArray arrayWithCapacity:(doubleBuffered ? 2 : 1)] retain];
+     }
+   else
+-    {
+-      return nil;
+-    }
++    return nil;
+ 
+   return self;
+ }
+@@ -10487,6 +10487,15 @@ - (void) setColorSpace: (CGColorSpaceRef)cs
+ }
+ 
+ 
++- (void) setDoubleBuffered: (bool)db
++{
++  if (doubleBuffered != db)
++    [self releaseSurfaces];
++
++  doubleBuffered = db;
++}
++
++
+ - (void) dealloc
+ {
+   [self releaseSurfaces];
+@@ -10558,7 +10567,7 @@ - (CGContextRef) getContext
+             }
+         }
+ 
+-      if (!surface && [cache count] >= CACHE_MAX_SIZE)
++      if (!surface && [cache count] >= (doubleBuffered ? 2 : 1))
+         {
+           /* Just grab the first one off the cache.  This may result
+              in tearing effects.  The alternative is to wait for one
+@@ -10611,7 +10620,7 @@ - (CGContextRef) getContext
+           return nil;
+         }
+ 
+-      CGContextTranslateCTM(context, 0, IOSurfaceGetHeight (currentSurface));
++      CGContextTranslateCTM(context, 0, IOSurfaceGetHeight (surface));
+       CGContextScaleCTM(context, scale, -scale);
+     }
+ 
+@@ -10628,6 +10637,7 @@ - (void) releaseContext
+   if (!context)
+     return;
+ 
++  CGContextFlush (context);
+   CGContextRelease (context);
+   context = NULL;
+ 
+@@ -10641,26 +10651,18 @@ - (void) display
+ {
+   NSTRACE_WHEN (NSTRACE_GROUP_FOCUS, "[EmacsLayer display]");
+ 
+-  if (context)
++  if (context && context != [[NSGraphicsContext currentContext] CGContext])
+     {
+       [self releaseContext];
+ 
+-#if CACHE_MAX_SIZE == 1
+-      /* This forces the layer to see the surface as updated.  */
++      /* This forces the layer to see the surface as updated even if
++         we replace it with itself.  */
+       [self setContents:nil];
+-#endif
+-
+       [self setContents:(id)currentSurface];
+ 
+       /* Put currentSurface back on the end of the cache.  */
+       [cache addObject:(id)currentSurface];
+       currentSurface = NULL;
+-
+-      /* Schedule a run of getContext so that if Emacs is idle it will
+-         perform the buffer copy, etc.  */
+-      [self performSelectorOnMainThread:@selector (getContext)
+-                             withObject:nil
+-                          waitUntilDone:NO];
+     }
+ }
+ 
+-- 
+2.39.3 (Apple Git-145)
+
